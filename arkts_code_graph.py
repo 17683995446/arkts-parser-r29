@@ -32,10 +32,10 @@ from typing import Optional
 # 你的鸿蒙项目根目录（绝对路径或相对路径）
 PROJECT_PATH = "/你的/鸿蒙/项目/路径"
 
-# 硅基流动 API 配置
-SILICONFLOW_API_KEY = "sk-uqelhavcdhfxjzjesdenxpbtqombamjniazzjtbssmdcwdvg"
-SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
-SILICONFLOW_MODEL = "Qwen/Qwen2.5-7B-Instruct"  # 免费模型
+# 硅基流动 API 配置（从环境变量读取，安全）
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
+SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+SILICONFLOW_MODEL = os.environ.get("SILICONFLOW_MODEL", "Qwen/Qwen2.5-7B-Instruct")  # 免费模型
 
 # 输出数据库文件名
 DB_FILE = "code_graph.db"
@@ -71,11 +71,20 @@ class ArkTSClass:
 
 
 @dataclass
+class ArkTSImport:
+    """导入信息"""
+    symbols: str  # 导入的符号（逗号分隔）或 *
+    source: str   # 来源模块
+    is_type: bool = False  # 是否是 type import
+
+
+@dataclass
 class ArkTSFile:
     """文件信息"""
     path: str
     line_count: int = 0
     classes: list = field(default_factory=list)
+    imports: list = field(default_factory=list)
 
 
 # ============================================================
@@ -87,6 +96,10 @@ class ArkTSParser:
     纯 Python 实现的 ArkTS 源码解析器。
     通过正则表达式和语法模式匹配，提取类、方法、调用关系、组件嵌套等信息。
     """
+
+    def __init__(self):
+        # 非代码范围缓存：content_hash -> ranges
+        self._non_code_cache = {}
 
     # 匹配装饰器: @Component, @Entry, @State, @Prop 等
     RE_DECORATOR = re.compile(r'@(\w+)(?:\s*\(([^)]*)\))?')
@@ -196,7 +209,41 @@ class ArkTSParser:
         classes = self._extract_classes(content, file_path)
         arkts_file.classes = classes
 
+        # 提取所有导入
+        imports = self._extract_imports(content)
+        arkts_file.imports = imports
+
         return arkts_file
+
+    def _extract_imports(self, content: str) -> list:
+        """从文件内容中提取所有import语句"""
+        imports = []
+
+        # 匹配各种import模式
+        # 1. import { a, b } from 'module'
+        # 2. import type { a } from 'module'
+        # 3. import * as name from 'module'
+        # 4. import defaultExport from 'module'
+        # 5. import { a } from 'module' assert { type: 'json' }
+
+        import_patterns = [
+            # import type { symbols } from 'source'
+            (r'import\s+type\s+\{([^}]+)\}\s+from\s+[\'"]([^\'"]+)[\'"]', True),
+            # import { symbols } from 'source'
+            (r'import\s+\{([^}]+)\}\s+from\s+[\'"]([^\'"]+)[\'"]', False),
+            # import * as name from 'source'
+            (r'import\s+\*\s+as\s+(\w+)\s+from\s+[\'"]([^\'"]+)[\'"]', False),
+            # import defaultExport from 'source'
+            (r'import\s+(\w+)\s+from\s+[\'"]([^\'"]+)[\'"]', False),
+        ]
+
+        for pattern, is_type in import_patterns:
+            for match in re.finditer(pattern, content):
+                symbols = match.group(1).strip()
+                source = match.group(2).strip()
+                imports.append(ArkTSImport(symbols=symbols, source=source, is_type=is_type))
+
+        return imports
 
     def _extract_classes(self, content: str, file_path: str) -> list:
         """从文件内容中提取所有类定义（支持 class 和 struct）"""
@@ -279,8 +326,30 @@ class ArkTSParser:
             # 找到类体的结束位置（简单的大括号匹配）
             class_body = self._extract_block(content, real_class_start)
 
-            # 提取方法
-            methods = self._extract_methods(class_body, class_name)
+            # 找出类体中嵌套的类/struct范围，用于排除嵌套类的方法
+            nested_class_ranges = []
+            # 对 class_body 重新计算非代码范围（因为位置是相对于 class_body 的）
+            body_non_code_ranges = self._find_non_code_ranges(class_body)
+            for nested_match in self.RE_CLASS.finditer(class_body):
+                if not self._is_in_range(nested_match.start(), body_non_code_ranges):
+                    # 找到嵌套类的类体范围
+                    nc_start = nested_match.start()
+                    # 找到嵌套类的 { 开始位置
+                    nc_brace_pos = class_body.find('{', nested_match.end())
+                    if nc_brace_pos >= 0:
+                        nc_body = self._extract_block(class_body, nc_brace_pos)
+                        # 范围从 struct/class 声明开始到类体闭合 } 结束
+                        nested_class_ranges.append((nc_start, nc_brace_pos + len(nc_body)))
+            for nested_match in self.RE_STRUCT.finditer(class_body):
+                if not self._is_in_range(nested_match.start(), body_non_code_ranges):
+                    nc_start = nested_match.start()
+                    nc_brace_pos = class_body.find('{', nested_match.end())
+                    if nc_brace_pos >= 0:
+                        nc_body = self._extract_block(class_body, nc_brace_pos)
+                        nested_class_ranges.append((nc_start, nc_brace_pos + len(nc_body)))
+
+            # 提取方法（传入嵌套类范围以排除）
+            methods = self._extract_methods(class_body, class_name, nested_class_ranges)
 
             cls = ArkTSClass(
                 name=class_name,
@@ -296,7 +365,12 @@ class ArkTSParser:
         return classes
 
     def _find_non_code_ranges(self, content: str) -> list:
-        """找到所有字符串和注释的范围（用于过滤假匹配）"""
+        """找到所有字符串和注释的范围（用于过滤假匹配，带缓存）"""
+        # 使用内容哈希作为缓存键
+        content_hash = hash(content)
+        if content_hash in self._non_code_cache:
+            return self._non_code_cache[content_hash]
+        
         ranges = []
         i = 0
         n = len(content)
@@ -386,13 +460,27 @@ class ArkTSParser:
 
             i += 1
 
+        # 存入缓存
+        self._non_code_cache[content_hash] = ranges
         return ranges
 
     def _is_in_range(self, pos: int, ranges: list) -> bool:
-        """检查位置是否在某个范围内"""
-        for start, end in ranges:
+        """检查位置是否在某个范围内（使用二分搜索优化）"""
+        # ranges 已按起始位置排序，使用二分搜索 O(log n)
+        if not ranges:
+            return False
+        
+        # 二分搜索：找到可能包含 pos 的范围
+        left, right = 0, len(ranges) - 1
+        while left <= right:
+            mid = (left + right) // 2
+            start, end = ranges[mid]
             if start <= pos < end:
                 return True
+            elif pos < start:
+                right = mid - 1
+            else:  # pos >= end
+                left = mid + 1
         return False
 
     def _extract_block(self, content: str, start: int) -> str:
@@ -405,6 +493,7 @@ class ArkTSParser:
         in_block_comment = False
         in_template_expr = False  # 模板字符串 ${...} 插值
         template_expr_depth = 0  # 插值中的独立括号深度
+        in_regex = False  # 正则字面量
 
         while i < len(content):
             ch = content[i]
@@ -422,6 +511,25 @@ class ArkTSParser:
                     continue
                 i += 1
                 continue
+            
+            # 处理正则字面量
+            if in_regex:
+                if ch == '\\':
+                    i += 2  # 跳过转义字符
+                    continue
+                if ch == '/':
+                    # 正则结束，跳过flags
+                    i += 1
+                    while i < len(content) and content[i] in 'gimsuy':
+                        i += 1
+                    in_regex = False
+                    continue
+                if ch == '\n':
+                    # 正则不能跨行，可能是误判
+                    in_regex = False
+                i += 1
+                continue
+            
             if not in_string and not in_template_expr:
                 if ch == '/' and i + 1 < len(content):
                     if content[i + 1] == '/':
@@ -432,6 +540,15 @@ class ArkTSParser:
                         in_block_comment = True
                         i += 2
                         continue
+                    # 检查是否是正则字面量（/ 后面不是 / 或 *）
+                    # 正则字面量的条件：前面是运算符、括号、关键字等
+                    # 简化判断：前面不是 ) ] } 字母 数字 _ $ " ' ` 时认为是正则
+                    if i > 0:
+                        prev = content[i - 1]
+                        if prev not in ')]}0123456789"\'`' and not prev.isalnum() and prev != '_':
+                            in_regex = True
+                            i += 1
+                            continue
 
             # 处理模板字符串插值 ${...}
             if in_template_expr:
@@ -498,9 +615,11 @@ class ArkTSParser:
 
         return content[start:]  # 未找到匹配，返回剩余内容
 
-    def _extract_methods(self, class_body: str, class_name: str) -> list:
+    def _extract_methods(self, class_body: str, class_name: str, nested_class_ranges: list = None) -> list:
         """从类体中提取所有方法"""
         methods = []
+        if nested_class_ranges is None:
+            nested_class_ranges = []
         keywords = {
             'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break',
             'continue', 'return', 'new', 'typeof', 'instanceof',
@@ -510,6 +629,11 @@ class ArkTSParser:
             'protected', 'abstract', 'override', 'super', 'this',
             'true', 'false', 'null', 'undefined', 'void', 'type', 'interface',
             'enum', 'namespace', 'module', 'declare', 'require',
+            # ArkTS 装饰器关键字（不是方法名）
+            'Component', 'Entry', 'State', 'Prop', 'Provide', 'Consume',
+            'Builder', 'BuilderParam', 'Watch', 'Link', 'StorageLink',
+            'StorageProp', 'Extend', 'Styles', 'Animatable', 'Observed',
+            'ObjectLink', 'Track', 'Volatile', 'Reusable', 'LazyForEach',
         }
         arkts_ui_components = {
             'Column', 'Row', 'Stack', 'List', 'Grid', 'Scroll', 'Tabs', 'TabContent',
@@ -532,17 +656,67 @@ class ArkTSParser:
 
         # 正则匹配所有方法声明位置
         # 匹配: [修饰符] 方法名[(泛型)](参数)
+        # 注意：不在此正则中匹配泛型参数（因为可能嵌套 <>），改为手动跳过
         method_pattern = re.compile(
-            r'(?<![.\w])'  # 前面不是 . 字母数字 或 =
+            r'(?<![.\w])'  # 前面不是 . 字母数字
             r'((?:(?:public|private|protected|static|async|override|abstract)\s+)*)'
             r'(\w+)'
-            r'\s*(?:<[^>]*>)?\s*\('
+            r'\s*'
         )
 
-        all_matches = list(method_pattern.finditer(class_body))
+        # 匹配箭头函数属性: name = (...) => { ... } 或 name = (...) => expression
+        arrow_func_pattern = re.compile(
+            r'(?<![.\w])'
+            r'((?:(?:public|private|protected|static|async|override|abstract)\s+)*)'
+            r'(\w+)'
+            r'\s*=\s*\('
+        )
+
+        def find_open_paren_after_name(body: str, after_pos: int) -> int:
+            """从方法名后查找匹配的 ( 位置，跳过泛型参数 <...>"""
+            i = after_pos
+            while i < len(body):
+                ch = body[i]
+                if ch == '<':
+                    # 跳过泛型参数（支持嵌套 <>）
+                    depth = 1
+                    i += 1
+                    while i < len(body) and depth > 0:
+                        if body[i] == '<':
+                            depth += 1
+                        elif body[i] == '>':
+                            depth -= 1
+                        i += 1
+                    continue
+                if ch == '(':
+                    return i
+                if ch in ('\n', ';', '{', '}', '='):
+                    # 遇到换行、分号、大括号、等号说明不是方法声明
+                    return -1
+                i += 1
+            return -1
+
+        # 合并两种模式的匹配结果，按位置排序
+        all_matches = []
+        for m in method_pattern.finditer(class_body):
+            # 手动查找 ( 位置
+            paren_pos = find_open_paren_after_name(class_body, m.end())
+            if paren_pos >= 0:
+                all_matches.append((m, paren_pos))
+        arrow_matches = list(arrow_func_pattern.finditer(class_body))
+        # 去重：如果同一位置已被 method_pattern 匹配，跳过箭头匹配
+        arrow_positions = set()
+        for m, pp in all_matches:
+            for i in range(m.start(), m.end()):
+                arrow_positions.add(i)
+        for am in arrow_matches:
+            if am.start() not in arrow_positions:
+                all_matches.append((am, am.end() - 1))  # arrow_func的(在end()-1
+        # 按位置排序
+        all_matches.sort(key=lambda x: x[0].start())
         processed_end = 0  # 已处理到的字符位置
 
-        for match in all_matches:
+        for match, actual_paren_start in all_matches:
             pos = match.start()
 
             # 跳过已处理过的区域
@@ -553,15 +727,23 @@ class ArkTSParser:
             if self._is_in_range(pos, non_code_ranges):
                 continue
 
+            # 跳过嵌套类/struct的范围
+            if self._is_in_range(pos, nested_class_ranges):
+                continue
+
             modifiers = match.group(1).strip() if match.group(1) else ''
             method_name = match.group(2)
+
+            # 跳过以数字开头的标识符（不是有效方法名）
+            if method_name[0].isdigit():
+                continue
 
             # 跳过关键字和 UI 组件
             if method_name in keywords or method_name in arkts_ui_components:
                 continue
 
             # 找到参数列表的右括号（括号平衡）
-            paren_start = match.end() - 1  # ( 的位置
+            paren_start = actual_paren_start  # 使用实际找到的 ( 位置
             paren_depth = 0
             paren_end = paren_start
             for k in range(paren_start, len(class_body)):
@@ -715,6 +897,8 @@ class ArkTSParser:
                 else:
                     after_type = ''  # 未找到
             else:
+                # after_paren 不以 : 开头（无返回类型）
+                # 检查是否是抽象方法（无返回类型、无方法体）
                 after_type = after_paren[0] if after_paren else ''
 
             is_abstract = after_type == ';'
@@ -729,20 +913,26 @@ class ArkTSParser:
                         # 在 rest_after_paren 中找到 return_type 的实际位置
                         # rest_after_paren 格式: ": ReturnType ..."
                         # 需要跳过 ": " 然后找到 return_type 的结束位置
-                        colon_idx = rest_after_paren.index(':')
-                        after_colon = rest_after_paren[colon_idx + 1:].lstrip()
-                        # after_colon 是 "ReturnType ..."（去掉前导空格）
-                        # return_type 已经被正确提取，找到它在 after_colon 中的位置
-                        ret_start_in_after = after_colon.find(return_type)
-                        if ret_start_in_after >= 0:
-                            # return_type 在 rest_after_paren 中的结束位置
-                            # = colon_idx + 1 + (空格数) + ret_start_in_after + len(return_type)
-                            spaces_before = len(rest_after_paren[colon_idx + 1:]) - len(after_colon)
-                            ret_end_abs = colon_idx + 1 + spaces_before + ret_start_in_after + len(return_type)
-                            after_ret = rest_after_paren[ret_end_abs:].lstrip()
-                            if after_ret and (after_ret[0] == '}' or
-                                re.match(r'(?:(?:public|private|protected|static|async|override|abstract)\s+)?\w+\s*\(', after_ret)):
-                                is_abstract = True
+                        colon_idx = rest_after_paren.find(':')
+                        if colon_idx >= 0:
+                            after_colon = rest_after_paren[colon_idx + 1:].lstrip()
+                            # after_colon 是 "ReturnType ..."（去掉前导空格）
+                            # return_type 已经被正确提取，找到它在 after_colon 中的位置
+                            ret_start_in_after = after_colon.find(return_type)
+                            if ret_start_in_after >= 0:
+                                # return_type 在 rest_after_paren 中的结束位置
+                                # = colon_idx + 1 + (空格数) + ret_start_in_after + len(return_type)
+                                spaces_before = len(rest_after_paren[colon_idx + 1:]) - len(after_colon)
+                                ret_end_abs = colon_idx + 1 + spaces_before + ret_start_in_after + len(return_type)
+                                after_ret = rest_after_paren[ret_end_abs:].lstrip()
+                                if after_ret and (after_ret[0] == '}' or
+                                    re.match(r'(?:(?:public|private|protected|static|async|override|abstract)\s+)?\w+\s*\(', after_ret)):
+                                    is_abstract = True
+            elif not is_abstract and after_type not in ('{', ';', ''):
+                # after_type 是其他字符（如下一个方法声明的开头）
+                # 检查是否是抽象方法（无返回类型）
+                if 'abstract' in modifiers:
+                    is_abstract = True
 
             has_body = after_type == '{'
 
@@ -752,14 +942,21 @@ class ArkTSParser:
             # 提取方法体
             method_body = ''
             if has_body:
-                # 找到方法体的 { 位置
-                brace_pos = class_body.index('{', paren_end)
-                method_body = self._extract_block(class_body, brace_pos)
-                processed_end = brace_pos + len(method_body)
+                # 找到方法体的 { 位置（使用find避免ValueError）
+                brace_pos = class_body.find('{', paren_end)
+                if brace_pos >= 0:
+                    method_body = self._extract_block(class_body, brace_pos)
+                    processed_end = brace_pos + len(method_body)
+                else:
+                    # 找不到 {，跳过此方法
+                    processed_end = paren_end + 1
             elif is_abstract:
                 if after_type == ';':
-                    semi_pos = class_body.index(';', paren_end)
-                    processed_end = semi_pos + 1
+                    semi_pos = class_body.find(';', paren_end)
+                    if semi_pos >= 0:
+                        processed_end = semi_pos + 1
+                    else:
+                        processed_end = paren_end + 1
                 else:
                     # 无分号的抽象方法，processed_end 设为返回类型结束位置
                     # 找到返回类型后的换行位置
@@ -827,18 +1024,44 @@ class ArkTSParser:
         return methods
 
     def _parse_params(self, params_str: str) -> list:
-        """解析参数列表（支持嵌套括号）"""
+        """解析参数列表（支持嵌套括号、字符串内逗号）"""
         params = []
         if not params_str.strip():
             return params
 
-        # 按顶层逗号分割（跳过括号内的逗号）
+        # 按顶层逗号分割（跳过括号内的逗号和字符串内的逗号）
         angle_depth = 0  # <> 的深度
         bracket_depth = 0  # () 的深度
         brace_depth = 0  # {} 的深度
         square_depth = 0  # [] 的深度（元组类型、数组解构）
+        in_string = False  # 是否在字符串内
+        string_char = None  # 字符串引号字符
         current = ''
-        for ch in params_str:
+        i = 0
+        while i < len(params_str):
+            ch = params_str[i]
+
+            # 处理字符串（跳过字符串内的逗号）
+            if in_string:
+                current += ch
+                if ch == '\\':
+                    # 转义字符，跳过下一个字符
+                    i += 1
+                    if i < len(params_str):
+                        current += params_str[i]
+                elif ch == string_char:
+                    in_string = False
+                i += 1
+                continue
+
+            # 检测字符串开始
+            if ch in ('"', "'"):
+                in_string = True
+                string_char = ch
+                current += ch
+                i += 1
+                continue
+
             if ch == '<':
                 angle_depth += 1
                 current += ch
@@ -874,6 +1097,7 @@ class ArkTSParser:
                 current = ''
             else:
                 current += ch
+            i += 1
 
         param = current.strip()
         if param:
@@ -882,35 +1106,122 @@ class ArkTSParser:
         return params
 
     def _parse_single_param(self, param_str: str) -> dict:
-        """解析单个参数"""
-        # 处理默认值（顶层 = 分割）
-        depth = 0
+        """解析单个参数（修复括号深度混用和函数类型=>问题）"""
+        # 处理默认值（顶层 = 分割，跳过字符串内）
+        angle_depth = 0   # <>
+        paren_depth = 0   # ()
+        brace_depth = 0   # {}
+        square_depth = 0  # []
+        in_string = False
+        string_char = None
         eq_pos = -1
-        for i, ch in enumerate(param_str):
-            if ch in '<([{':
-                depth += 1
-            elif ch in ')]}':
-                depth -= 1
-            elif ch == '=' and depth == 0:
-                eq_pos = i
-                break
+        i = 0
+        while i < len(param_str):
+            ch = param_str[i]
+            if in_string:
+                if ch == '\\':
+                    i += 2
+                    continue
+                if ch == string_char:
+                    in_string = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_string = True
+                string_char = ch
+                i += 1
+                continue
+            if ch == '<':
+                angle_depth += 1
+            elif ch == '>':
+                # 检查是否是 => 箭头
+                if i > 0 and param_str[i-1] == '=':
+                    pass  # => 箭头，不影响深度
+                elif angle_depth > 0:
+                    angle_depth -= 1
+            elif ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                if paren_depth > 0:
+                    paren_depth -= 1
+            elif ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                if brace_depth > 0:
+                    brace_depth -= 1
+            elif ch == '[':
+                square_depth += 1
+            elif ch == ']':
+                if square_depth > 0:
+                    square_depth -= 1
+            elif ch == '=':
+                # 检查是否是 => 箭头
+                if i + 1 < len(param_str) and param_str[i+1] == '>':
+                    pass  # => 箭头，不是赋值
+                elif angle_depth == 0 and paren_depth == 0 and brace_depth == 0 and square_depth == 0:
+                    eq_pos = i
+                    break
+            i += 1
 
         if eq_pos >= 0:
             name_type = param_str[:eq_pos].strip()
         else:
             name_type = param_str
 
-        # 分离名称和类型（顶层 : 分割）
-        depth = 0
+        # 分离名称和类型（顶层 : 分割，但跳过函数类型的 =>）
+        angle_depth = 0
+        paren_depth = 0
+        brace_depth = 0
+        square_depth = 0
+        in_string = False
+        string_char = None
         colon_pos = -1
-        for i, ch in enumerate(name_type):
-            if ch in '<([{':
-                depth += 1
-            elif ch in ')]}':
-                depth -= 1
-            elif ch == ':' and depth == 0:
-                colon_pos = i
-                break
+        i = 0
+        while i < len(name_type):
+            ch = name_type[i]
+            if in_string:
+                if ch == '\\':
+                    i += 2
+                    continue
+                if ch == string_char:
+                    in_string = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_string = True
+                string_char = ch
+                i += 1
+                continue
+            if ch == '<':
+                angle_depth += 1
+            elif ch == '>':
+                if i > 0 and name_type[i-1] == '=':
+                    pass
+                elif angle_depth > 0:
+                    angle_depth -= 1
+            elif ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                if paren_depth > 0:
+                    paren_depth -= 1
+            elif ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                if brace_depth > 0:
+                    brace_depth -= 1
+            elif ch == '[':
+                square_depth += 1
+            elif ch == ']':
+                if square_depth > 0:
+                    square_depth -= 1
+            elif ch == ':':
+                # 检查是否是 => 箭头的一部分（前面是 =）
+                if i > 0 and name_type[i-1] == '=':
+                    pass  # => 箭头的一部分，跳过
+                elif angle_depth == 0 and paren_depth == 0 and brace_depth == 0 and square_depth == 0:
+                    colon_pos = i
+                    break
+            i += 1
 
         if colon_pos >= 0:
             name = name_type[:colon_pos].strip()
@@ -1078,21 +1389,14 @@ class CodeKnowledgeGraph:
         self._init_db()
 
     def _init_db(self):
-        """初始化数据库表结构"""
+        """初始化数据库表结构（使用CREATE TABLE IF NOT EXISTS避免数据丢失）"""
         self.cursor.executescript("""
-            DROP TABLE IF EXISTS files;
-            DROP TABLE IF EXISTS classes;
-            DROP TABLE IF EXISTS methods;
-            DROP TABLE IF EXISTS method_calls;
-            DROP TABLE IF EXISTS component_nesting;
-            DROP TABLE IF EXISTS imports;
-
-            CREATE TABLE files (
+            CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 line_count INTEGER
             );
 
-            CREATE TABLE classes (
+            CREATE TABLE IF NOT EXISTS classes (
                 name TEXT,
                 file_path TEXT,
                 is_component BOOLEAN DEFAULT 0,
@@ -1102,16 +1406,16 @@ class CodeKnowledgeGraph:
                 PRIMARY KEY (name, file_path)
             );
 
-            CREATE TABLE methods (
+            CREATE TABLE IF NOT EXISTS methods (
                 name TEXT,
                 class_name TEXT,
                 return_type TEXT DEFAULT 'void',
                 params TEXT DEFAULT '',
                 decorators TEXT DEFAULT '',
-                PRIMARY KEY (name, class_name)
+                PRIMARY KEY (name, class_name, params)
             );
 
-            CREATE TABLE method_calls (
+            CREATE TABLE IF NOT EXISTS method_calls (
                 caller TEXT,
                 caller_class TEXT,
                 callee TEXT,
@@ -1119,13 +1423,13 @@ class CodeKnowledgeGraph:
                 PRIMARY KEY (caller, caller_class, callee, callee_class)
             );
 
-            CREATE TABLE component_nesting (
+            CREATE TABLE IF NOT EXISTS component_nesting (
                 parent TEXT,
                 child TEXT,
                 PRIMARY KEY (parent, child)
             );
 
-            CREATE TABLE imports (
+            CREATE TABLE IF NOT EXISTS imports (
                 file_path TEXT,
                 symbols TEXT,
                 source TEXT
@@ -1141,83 +1445,157 @@ class CodeKnowledgeGraph:
         """)
         self.conn.commit()
 
-    def build(self, project_path: str):
-        """解析项目并构建知识图谱"""
+    def build(self, project_path: str, clean: bool = False):
+        """解析项目并构建知识图谱
+        
+        Args:
+            project_path: 项目路径
+            clean: 是否清理旧数据（默认False，保留历史数据）
+        """
         parser = ArkTSParser()
         files = parser.parse_project(project_path)
 
-        file_count = 0
-        class_count = 0
-        method_count = 0
-        call_count = 0
+        # 如果需要清理旧数据，先删除相关表
+        if clean:
+            self.cursor.execute("DELETE FROM files")
+            self.cursor.execute("DELETE FROM classes")
+            self.cursor.execute("DELETE FROM methods")
+            self.cursor.execute("DELETE FROM method_calls")
+            self.cursor.execute("DELETE FROM component_nesting")
+            self.cursor.execute("DELETE FROM imports")
+            self.conn.commit()
 
-        for arkts_file in files:
-            # 插入文件（支持重复build）
-            self.cursor.execute(
-                "INSERT OR REPLACE INTO files VALUES (?, ?)",
-                (arkts_file.path, arkts_file.line_count)
-            )
-            file_count += 1
+        # 收集当前项目的所有文件路径，用于后续清理
+        current_file_paths = set(f.path for f in files)
 
-            for cls in arkts_file.classes:
-                # 插入类
+        # 开启事务
+        self.cursor.execute("BEGIN")
+
+        try:
+            file_count = 0
+            class_count = 0
+            method_count = 0
+            call_count = 0
+            import_count = 0
+
+            for arkts_file in files:
+                # 先清理该文件中旧的类数据（支持同一文件内容变更）
+                self.cursor.execute("SELECT name FROM classes WHERE file_path = ?", (arkts_file.path,))
+                old_class_names = [row[0] for row in self.cursor.fetchall()]
+                current_class_names = set(cls.name for cls in arkts_file.classes)
+                for old_name in old_class_names:
+                    if old_name not in current_class_names:
+                        # 删除旧类及其相关数据
+                        self.cursor.execute("DELETE FROM methods WHERE class_name = ?", (old_name,))
+                        self.cursor.execute("DELETE FROM method_calls WHERE caller_class = ?", (old_name,))
+                        self.cursor.execute("DELETE FROM component_nesting WHERE parent = ?", (old_name,))
+                        self.cursor.execute("DELETE FROM classes WHERE name = ? AND file_path = ?", (old_name, arkts_file.path))
+
+                # 插入文件（支持重复build）
                 self.cursor.execute(
-                    "INSERT OR REPLACE INTO classes VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        cls.name,
-                        cls.file_path,
-                        int(cls.is_component),
-                        int(cls.is_entry),
-                        cls.parent_class,
-                        ','.join(cls.decorators),
-                    )
+                    "INSERT OR REPLACE INTO files VALUES (?, ?)",
+                    (arkts_file.path, arkts_file.line_count)
                 )
-                class_count += 1
+                file_count += 1
 
-                for method in cls.methods:
-                    # 插入方法
-                    params_str = ';'.join(
-                        f"{p['name']}:{p['type']}" for p in method.params
-                    )
+                # 清理并重新插入该文件的导入信息
+                self.cursor.execute("DELETE FROM imports WHERE file_path = ?", (arkts_file.path,))
+                for imp in arkts_file.imports:
                     self.cursor.execute(
-                        "INSERT OR REPLACE INTO methods VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO imports VALUES (?, ?, ?)",
+                        (arkts_file.path, imp.symbols, imp.source)
+                    )
+                    import_count += 1
+
+                for cls in arkts_file.classes:
+                    # 插入类
+                    self.cursor.execute(
+                        "INSERT OR REPLACE INTO classes VALUES (?, ?, ?, ?, ?, ?)",
                         (
-                            method.name,
                             cls.name,
-                            method.return_type,
-                            params_str,
-                            ','.join(method.decorators),
+                            cls.file_path,
+                            int(cls.is_component),
+                            int(cls.is_entry),
+                            cls.parent_class,
+                            ','.join(cls.decorators),
                         )
                     )
-                    method_count += 1
+                    class_count += 1
 
-                    # 插入方法调用关系
-                    for callee_name, callee_class in method.called_methods:
-                        self.cursor.execute(
-                            "INSERT OR IGNORE INTO method_calls VALUES (?, ?, ?, ?)",
-                            (method.name, cls.name, callee_name, callee_class)
+                    for method in cls.methods:
+                        # 插入方法（支持重载：主键包含参数签名）
+                        params_str = ';'.join(
+                            f"{p['name']}:{p['type']}" for p in method.params
                         )
-                        call_count += 1
-
-                    # 插入组件嵌套关系
-                    if method.name == 'build' and method.nested_components:
-                        for child in method.nested_components:
-                            self.cursor.execute(
-                                "INSERT OR IGNORE INTO component_nesting VALUES (?, ?)",
-                                (cls.name, child)
+                        self.cursor.execute(
+                            "INSERT OR REPLACE INTO methods VALUES (?, ?, ?, ?, ?)",
+                            (
+                                method.name,
+                                cls.name,
+                                method.return_type,
+                                params_str,
+                                ','.join(method.decorators),
                             )
+                        )
+                        method_count += 1
 
-        self.conn.commit()
+                        # 插入方法调用关系
+                        for callee_name, callee_class in method.called_methods:
+                            self.cursor.execute(
+                                "INSERT OR IGNORE INTO method_calls VALUES (?, ?, ?, ?)",
+                                (method.name, cls.name, callee_name, callee_class)
+                            )
+                            call_count += 1
 
-        print(f"\n📊 知识图谱构建完成！")
-        print(f"   📁 文件数: {file_count}")
-        print(f"   📦 类/组件数: {class_count}")
-        print(f"   🔧 方法数: {method_count}")
-        print(f"   🔗 调用关系数: {call_count}")
-        print(f"   💾 数据库已保存到: {self.db_path}")
+                        # 插入组件嵌套关系
+                        if method.name == 'build' and method.nested_components:
+                            for child in method.nested_components:
+                                self.cursor.execute(
+                                    "INSERT OR IGNORE INTO component_nesting VALUES (?, ?)",
+                                    (cls.name, child)
+                                )
+
+            # 清理已不存在的文件数据
+            if current_file_paths:
+                # 获取数据库中所有文件路径
+                self.cursor.execute("SELECT path FROM files")
+                all_db_paths = [row[0] for row in self.cursor.fetchall()]
+                
+                for db_path in all_db_paths:
+                    if db_path not in current_file_paths:
+                        # 删除该文件相关的所有数据
+                        self.cursor.execute("DELETE FROM files WHERE path = ?", (db_path,))
+                        self.cursor.execute("DELETE FROM imports WHERE file_path = ?", (db_path,))
+                        # 获取该文件中的类
+                        self.cursor.execute("SELECT name FROM classes WHERE file_path = ?", (db_path,))
+                        class_names = [row[0] for row in self.cursor.fetchall()]
+                        for cls_name in class_names:
+                            self.cursor.execute("DELETE FROM methods WHERE class_name = ?", (cls_name,))
+                            self.cursor.execute("DELETE FROM method_calls WHERE caller_class = ?", (cls_name,))
+                            self.cursor.execute("DELETE FROM component_nesting WHERE parent = ?", (cls_name,))
+                        self.cursor.execute("DELETE FROM classes WHERE file_path = ?", (db_path,))
+
+            self.conn.commit()
+
+            print(f"\n📊 知识图谱构建完成！")
+            print(f"   📁 文件数: {file_count}")
+            print(f"   📦 类/组件数: {class_count}")
+            print(f"   🔧 方法数: {method_count}")
+            print(f"   🔗 调用关系数: {call_count}")
+            print(f"   📥 导入数: {import_count}")
+            print(f"   💾 数据库已保存到: {self.db_path}")
+
+        except Exception as e:
+            self.conn.rollback()
+            print(f"❌ 构建失败，事务已回滚: {e}")
+            raise
 
     def execute_sql(self, sql: str, params: tuple = ()) -> list:
-        """执行 SQL 查询并返回结果（支持参数化查询）"""
+        """执行 SQL 查询并返回结果（仅允许只读操作）"""
+        # 安全检查：只允许 SELECT 语句，阻止 DROP/DELETE/UPDATE/INSERT/ALTER 等
+        stripped = sql.strip().upper()
+        if not stripped.startswith('SELECT') and not stripped.startswith('PRAGMA'):
+            return [{"error": "安全限制：仅允许 SELECT 和 PRAGMA 查询语句"}]
         try:
             self.cursor.execute(sql, params)
             columns = [desc[0] for desc in self.cursor.description]
